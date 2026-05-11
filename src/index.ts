@@ -59,6 +59,23 @@ function debug(...args: unknown[]) {
 	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
 }
 
+function extractMcporterBlock(systemPrompt?: string): string | undefined {
+	if (!systemPrompt) return undefined;
+	const startMarker = "<mcporter>";
+	const endMarker = "</mcporter>";
+	const start = systemPrompt.indexOf(startMarker);
+	if (start === -1) return undefined;
+	const end = systemPrompt.indexOf(endMarker, start);
+	if (end === -1) return undefined;
+	return systemPrompt.slice(start, end + endMarker.length).trim();
+}
+
+function saveDebugSystemPrompt(tag: string, systemPrompt: string): void {
+	if (!DEBUG) return;
+	appendFileSync(join(dirname(DEBUG_LOG_PATH), "system-prompt.log"),
+		`\n\n--- ${new Date().toISOString()} ${tag} len=${systemPrompt.length} ---\n${systemPrompt}\n`);
+}
+
 // Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
 // CLI subprocess to write its own debug log to a file we choose, and also
 // forward its stderr into our debug stream. Drops straight into the real SDK's
@@ -958,8 +975,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
-	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
+	const mcporterAppend = appendSystemPrompt ? extractMcporterBlock(context.systemPrompt) : undefined;
+	const appendParts = [agentsAppend, skillsAppend, mcporterAppend].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+	const systemPrompt = systemPromptAppend ?? "";
+	saveDebugSystemPrompt("provider", systemPrompt);
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
@@ -1003,10 +1023,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		systemPrompt: {
-			type: "preset", preset: "claude_code",
-			append: systemPromptAppend ? systemPromptAppend : undefined,
-		},
+		systemPrompt,
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(settingSources ? { settingSources } : {}),
@@ -1019,6 +1036,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	debug("provider: fresh query",
 		`model=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
+		`systemPrompt=custom len=${systemPromptAppend?.length ?? 0} mcporter=${mcporterAppend?.length ?? 0}`,
 		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
@@ -1199,6 +1217,8 @@ async function promptAndWait(
 	// Skills append
 	const skillsBlock = options?.appendSkills !== false && options?.systemPrompt
 		? extractSkillsBlock(options.systemPrompt) : undefined;
+	const systemPrompt = skillsBlock ?? "";
+	saveDebugSystemPrompt("askclaude", systemPrompt);
 
 	// Effort
 	const effort = options?.thinking && options.thinking !== "off"
@@ -1215,6 +1235,7 @@ async function promptAndWait(
 	debug("askClaude:",
 		`mode=${mode} model=${modelId} effort=${effort ?? "default"}`,
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
+		`systemPrompt=custom len=${skillsBlock?.length ?? 0}`,
 		`skills=${Boolean(skillsBlock)} promptLen=${prompt.length}`);
 
 	const sdkQuery = query({
@@ -1225,9 +1246,7 @@ async function promptAndWait(
 			permissionMode: "bypassPermissions",
 			...(disallowedTools.length ? { disallowedTools } : {}),
 			...(effort ? { effort } : {}),
-			systemPrompt: skillsBlock
-				? { type: "preset", preset: "claude_code", append: skillsBlock }
-				: undefined,
+			systemPrompt,
 			settingSources: ["user", "project"] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
