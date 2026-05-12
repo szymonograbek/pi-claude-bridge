@@ -11,12 +11,12 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { buildModels, resolveModelId as _resolveModelId } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
+import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx, stackDepth, pushContext, popContext } from "./query-state.js";
 import { loadConfig } from "./config.js";
-import { extractAgentsAppend } from "./agents-md.js";
+import { buildForwardedSystemPrompt, DEFAULT_ASKCLAUDE_SYSTEM_PROMPT_FORWARDING, DEFAULT_PROVIDER_SYSTEM_PROMPT_FORWARDING, type SystemPromptForwardingConfig } from "./system-prompt-forwarding.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 
@@ -57,17 +57,6 @@ function debug(...args: unknown[]) {
 	};
 	const msg = args.map(fmt).join(" ");
 	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
-}
-
-function extractMcporterBlock(systemPrompt?: string): string | undefined {
-	if (!systemPrompt) return undefined;
-	const startMarker = "<mcporter>";
-	const endMarker = "</mcporter>";
-	const start = systemPrompt.indexOf(startMarker);
-	if (start === -1) return undefined;
-	const end = systemPrompt.indexOf(endMarker, start);
-	if (end === -1) return undefined;
-	return systemPrompt.slice(start, end + endMarker.length).trim();
 }
 
 function saveDebugSystemPrompt(tag: string, systemPrompt: string): void {
@@ -973,12 +962,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const mcpServers = buildMcpServers(mcpTools, ctx());
 	const providerSettings = loadConfig(cwd).provider ?? {};
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
-	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
-	const mcporterAppend = appendSystemPrompt ? extractMcporterBlock(context.systemPrompt) : undefined;
-	const appendParts = [agentsAppend, skillsAppend, mcporterAppend].filter((part): part is string => Boolean(part));
-	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-	const systemPrompt = systemPromptAppend ?? "";
+	const systemPrompt = appendSystemPrompt
+		? buildForwardedSystemPrompt(context.systemPrompt, {
+			defaultConfig: DEFAULT_PROVIDER_SYSTEM_PROMPT_FORWARDING,
+			config: providerSettings.systemPromptForwarding,
+		})
+		: "";
 	saveDebugSystemPrompt("provider", systemPrompt);
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
@@ -1036,7 +1025,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	debug("provider: fresh query",
 		`model=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-		`systemPrompt=custom len=${systemPromptAppend?.length ?? 0} mcporter=${mcporterAppend?.length ?? 0}`,
+		`systemPrompt=custom len=${systemPrompt.length}`,
 		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
@@ -1183,6 +1172,7 @@ async function promptAndWait(
 	options?: {
 		systemPrompt?: string;
 		appendSkills?: boolean;
+		systemPromptForwarding?: SystemPromptForwardingConfig;
 		onStreamUpdate?: (responseText: string) => void;
 		model?: string;
 		thinking?: string;
@@ -1214,10 +1204,13 @@ async function promptAndWait(
 	// Mode → disallowed tools
 	const disallowedTools = MODE_DISALLOWED_TOOLS[mode] ?? [];
 
-	// Skills append
-	const skillsBlock = options?.appendSkills !== false && options?.systemPrompt
-		? extractSkillsBlock(options.systemPrompt) : undefined;
-	const systemPrompt = skillsBlock ?? "";
+	const systemPrompt = options?.appendSkills === false && !options.systemPromptForwarding
+		? ""
+		: buildForwardedSystemPrompt(options?.systemPrompt, {
+			defaultConfig: DEFAULT_ASKCLAUDE_SYSTEM_PROMPT_FORWARDING,
+			config: options?.systemPromptForwarding,
+			includeAgentsMd: false,
+		});
 	saveDebugSystemPrompt("askclaude", systemPrompt);
 
 	// Effort
@@ -1235,8 +1228,8 @@ async function promptAndWait(
 	debug("askClaude:",
 		`mode=${mode} model=${modelId} effort=${effort ?? "default"}`,
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
-		`systemPrompt=custom len=${skillsBlock?.length ?? 0}`,
-		`skills=${Boolean(skillsBlock)} promptLen=${prompt.length}`);
+		`systemPrompt=custom len=${systemPrompt.length}`,
+		`promptLen=${prompt.length}`);
 
 	const sdkQuery = query({
 		prompt,
@@ -1515,6 +1508,7 @@ export default function (pi: ExtensionAPI) {
 					const result = await promptAndWait(params.prompt, mode, toolCalls, signal, {
 						systemPrompt: ctx.getSystemPrompt(),
 						appendSkills: askConf?.appendSkills,
+						systemPromptForwarding: askConf?.systemPromptForwarding,
 						model: params.model,
 						thinking: params.thinking,
 						isolated,

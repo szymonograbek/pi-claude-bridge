@@ -4,6 +4,7 @@
 // empty object returned) so the extension always starts.
 
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { SystemPromptForwardingConfig } from "./system-prompt-forwarding.js";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -18,10 +19,12 @@ export interface Config {
 		defaultIsolated?: boolean;
 		allowFullMode?: boolean;
 		appendSkills?: boolean;
+		systemPromptForwarding?: SystemPromptForwardingConfig;
 	};
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
 		appendSystemPrompt?: boolean;
+		systemPromptForwarding?: SystemPromptForwardingConfig;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;

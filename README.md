@@ -25,7 +25,7 @@ pi install npm:pi-claude-bridge
 
 Use `/model` to select `claude-bridge/claude-opus-4-7`, `claude-bridge/claude-opus-4-6`, `claude-bridge/claude-sonnet-4-6`, or `claude-bridge/claude-haiku-4-5`.
 
-Behind the scenes, pi's tools are bridged to Claude Code but it should all work like normal in pi. Bash commands get a 120-second default timeout (matching Claude Code's default) since pi's bash has no timeout by default. Skills in pi are copied over to Claude Code's system prompt so should work as they would with any other pi provider.
+Behind the scenes, pi's tools are bridged to Claude Code but it should all work like normal in pi. Bash commands get a 120-second default timeout (matching Claude Code's default) since pi's bash has no timeout by default. Selected Pi system-prompt fragments (skills, AGENTS.md, and configured extension blocks) are forwarded to Claude Code so they work as they would with any other pi provider.
 
 ## AskClaude Tool
 
@@ -57,11 +57,19 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or `.pi/claude-bridge.json` (p
     "enabled": true,
     "allowFullMode": true,
     "defaultIsolated": false,
-    "description": "Custom tool description override"
+    "description": "Custom tool description override",
+    "systemPromptForwarding": {
+      "mode": "selected",
+      "include": [{ "kind": "skills" }, { "kind": "xmlTag", "tag": "memories" }]
+    }
   },
   "provider": {
     "strictMcpConfig": true,
-    "pathToClaudeCodeExecutable": "/home/you/.nix-profile/bin/claude"
+    "pathToClaudeCodeExecutable": "/home/you/.nix-profile/bin/claude",
+    "systemPromptForwarding": {
+      "mode": "selected",
+      "include": [{ "kind": "agentsMd" }, { "kind": "skills" }, { "kind": "xmlTag", "tag": "mcporter" }]
+    }
   }
 }
 ```
@@ -72,13 +80,27 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or `.pi/claude-bridge.json` (p
 - `defaultMode` — `"read"` (default), `"none"`, or `"full"`
 - `defaultIsolated` — start each call in a fresh session (default `false`)
 - `allowFullMode` — allow `mode: "full"`; set `false` to lock it out
-- `appendSkills` — forward pi's skills block into the system prompt (default `true`)
+- `appendSkills` — legacy switch for default skills forwarding (default `true`; ignored when `systemPromptForwarding` is set)
+- `systemPromptForwarding` — controls which parts of Pi's system prompt are forwarded to Claude Code (default: skills only)
 
 `provider` (low-level SDK plumbing, most users can ignore):
-- `appendSystemPrompt` — append pi's AGENTS.md and skills (default `true`)
+- `appendSystemPrompt` — enable system prompt forwarding (default `true`)
+- `systemPromptForwarding` — controls which parts of Pi's system prompt are forwarded to Claude Code (default: `agentsMd`, `skills`, `xmlTag: mcporter`, `xmlTag: memories`)
 - `settingSources` — CC filesystem settings to load; only applied when `appendSystemPrompt: false`
 - `strictMcpConfig` — block MCP servers from `~/.claude.json` / `.mcp.json` (default `true`). Cloud MCP (Gmail/Drive via claude.ai OAuth) is always blocked.
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Required on **NixOS** (and other non-FHS systems) where the SDK's bundled musl/glibc binaries can't run. Set to your Nix-installed binary, e.g. `"/home/you/.nix-profile/bin/claude"`.
+
+`systemPromptForwarding` supports:
+- `mode`: `"selected"` (include matching fragments), `"full"` (forward Pi's full prompt, minus `exclude`), or `"none"`
+- selector kinds: `agentsMd`, `skills`, `xmlTag`, `between`, `heading`
+
+Examples:
+
+```json
+{ "kind": "xmlTag", "tag": "memories" }
+{ "kind": "between", "start": "Start marker", "end": "End marker" }
+{ "kind": "heading", "heading": "Project Context" }
+```
 
 ## Tests
 
