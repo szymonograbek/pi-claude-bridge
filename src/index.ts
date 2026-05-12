@@ -15,7 +15,7 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx, stackDepth, pushContext, popContext } from "./query-state.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, scopeToSettingSources } from "./config.js";
 import { buildForwardedSystemPrompt, DEFAULT_ASKCLAUDE_SYSTEM_PROMPT_FORWARDING, DEFAULT_PROVIDER_SYSTEM_PROMPT_FORWARDING, type SystemPromptForwardingConfig } from "./system-prompt-forwarding.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -960,7 +960,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		? wrapPromptStream(promptBlocks)
 		: promptText;
 	const mcpServers = buildMcpServers(mcpTools, ctx());
-	const providerSettings = loadConfig(cwd).provider ?? {};
+	const cfg = loadConfig(cwd);
+	const providerSettings = cfg.provider ?? {};
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const systemPrompt = appendSystemPrompt
 		? buildForwardedSystemPrompt(context.systemPrompt, {
@@ -975,9 +976,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
 	// programmatically and ignore filesystem MCP entries — applied unconditionally because
 	// settingSources=undefined does NOT give isolation (the CC default loads all sources).
-	const settingSources: SettingSource[] | undefined = appendSystemPrompt
-		? undefined
-		: providerSettings.settingSources ?? ["user", "project"];
+	// claudeMdScope (when set) is authoritative for which CLAUDE.md files CC loads.
+	// When unset, preserve historical behavior: with appendSystemPrompt=true pi forwards
+	// its own agentsMd, so we don't ask CC to also load CLAUDE.md (settingSources=undefined);
+	// with appendSystemPrompt=false fall back to provider.settingSources or ["user","project"].
+	const settingSources: SettingSource[] | undefined = cfg.claudeMdScope
+		? scopeToSettingSources(cfg.claudeMdScope)
+		: appendSystemPrompt
+			? undefined
+			: providerSettings.settingSources ?? ["user", "project"];
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -1015,7 +1022,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		systemPrompt,
 		extraArgs,
 		...(effort ? { effort } : {}),
-		...(settingSources ? { settingSources } : {}),
+		...(settingSources !== undefined ? { settingSources } : {}),
 		...(mcpServers ? { mcpServers } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
@@ -1217,7 +1224,12 @@ async function promptAndWait(
 	const effort = options?.thinking && options.thinking !== "off"
 		? REASONING_TO_EFFORT[options.thinking] : undefined;
 
-	const claudeExecutable = loadConfig(cwd).provider?.pathToClaudeCodeExecutable;
+	const askCfg = loadConfig(cwd);
+	const claudeExecutable = askCfg.provider?.pathToClaudeCodeExecutable;
+	// Default scope matches the previous hardcoded ["user", "project"]; [] disables CLAUDE.md.
+	const askSettingSources: SettingSource[] = scopeToSettingSources(
+		askCfg.claudeMdScope ?? ["project", "global"],
+	);
 
 	const extraArgs: Record<string, string | null> = {
 		"strict-mcp-config": null,
@@ -1240,7 +1252,7 @@ async function promptAndWait(
 			...(disallowedTools.length ? { disallowedTools } : {}),
 			...(effort ? { effort } : {}),
 			systemPrompt,
-			settingSources: ["user", "project"] as SettingSource[],
+			settingSources: askSettingSources,
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),

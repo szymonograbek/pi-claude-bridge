@@ -9,7 +9,21 @@ import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+/**
+ * Which CLAUDE.md files Claude Code should auto-load into context.
+ * - "project" → the project's CLAUDE.md (under cwd)
+ * - "global"  → the user's ~/.claude/CLAUDE.md
+ * An empty array attaches no CLAUDE.md at all.
+ */
+export type ClaudeMdScope = "project" | "global";
+
 export interface Config {
+	/**
+	 * Controls which CLAUDE.md files Claude Code attaches to its context
+	 * (applies to both the provider path and the AskClaude tool).
+	 * Omit to keep historical defaults; pass [] to disable entirely.
+	 */
+	claudeMdScope?: ClaudeMdScope[];
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;
@@ -45,7 +59,22 @@ export function loadConfig(cwd: string): Config {
 	const global = tryParseJson(join(homedir(), ".pi", "agent", "claude-bridge.json"));
 	const project = tryParseJson(join(cwd, ".pi", "claude-bridge.json"));
 	return {
+		...(project.claudeMdScope !== undefined
+			? { claudeMdScope: project.claudeMdScope }
+			: global.claudeMdScope !== undefined
+				? { claudeMdScope: global.claudeMdScope }
+				: {}),
 		askClaude: { ...global.askClaude, ...project.askClaude },
 		provider: { ...global.provider, ...project.provider },
 	};
+}
+
+const SCOPE_TO_SETTING_SOURCE: Record<ClaudeMdScope, SettingSource> = {
+	project: "project",
+	global: "user",
+};
+
+/** Map the user-facing scope list to Claude Agent SDK SettingSource entries. */
+export function scopeToSettingSources(scope: ClaudeMdScope[]): SettingSource[] {
+	return scope.map((s) => SCOPE_TO_SETTING_SOURCE[s]);
 }

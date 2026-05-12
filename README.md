@@ -51,8 +51,12 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 
 Config: `~/.pi/agent/claude-bridge.json` (global) or `.pi/claude-bridge.json` (project; merged over global).
 
+Top-level options:
+- `claudeMdScope` — which `CLAUDE.md` files Claude Code attaches to its context. An array containing any of `"project"` (cwd's `CLAUDE.md`) and `"global"` (`~/.claude/CLAUDE.md`). Pass `[]` to attach none. Applies to both the provider path and the AskClaude tool. Omit to keep historical defaults.
+
 ```json
 {
+  "claudeMdScope": ["project"],
   "askClaude": {
     "enabled": true,
     "allowFullMode": true,
