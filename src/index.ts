@@ -15,7 +15,7 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx, stackDepth, pushContext, popContext } from "./query-state.js";
-import { loadConfig, scopeToSettingSources } from "./config.js";
+import { loadConfig, scopeToSettingSources, type DynamicContextConfig } from "./config.js";
 import { buildForwardedSystemPrompt, DEFAULT_ASKCLAUDE_SYSTEM_PROMPT_FORWARDING, DEFAULT_PROVIDER_SYSTEM_PROMPT_FORWARDING, type SystemPromptForwardingConfig } from "./system-prompt-forwarding.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -291,6 +291,104 @@ interface SyncResult {
 	sessionId: string | null;
 }
 
+type PiContextMessage = Context["messages"][number];
+
+const DEFAULT_DYNAMIC_CONTEXT_CONFIG: DynamicContextConfig = {
+	enabled: false,
+	match: { details: { dynamicContext: true } },
+	stripFromSession: true,
+	wrapUserRequestTag: "user_request",
+};
+
+function resolveDynamicContextConfig(config: DynamicContextConfig | undefined): DynamicContextConfig {
+	return {
+		...DEFAULT_DYNAMIC_CONTEXT_CONFIG,
+		...config,
+		match: { ...DEFAULT_DYNAMIC_CONTEXT_CONFIG.match, ...config?.match },
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function messageDetails(message: PiContextMessage): Record<string, unknown> | undefined {
+	if (!isRecord(message)) return undefined;
+	const details = message.details;
+	return isRecord(details) ? details : undefined;
+}
+
+function messageCustomType(message: PiContextMessage): string | undefined {
+	if (!isRecord(message)) return undefined;
+	return typeof message.customType === "string" ? message.customType : undefined;
+}
+
+function matchesDynamicContext(message: PiContextMessage, config: DynamicContextConfig): boolean {
+	if (config.enabled !== true) return false;
+	const match = config.match;
+	if (!match) return false;
+	if (match.customType !== undefined && messageCustomType(message) !== match.customType) return false;
+	if (match.details) {
+		const details = messageDetails(message);
+		if (!details) return false;
+		for (const [key, value] of Object.entries(match.details)) {
+			if (details[key] !== value) return false;
+		}
+	}
+	return true;
+}
+
+function dynamicContextText(message: PiContextMessage): string {
+	if (!isRecord(message)) return "";
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block)) continue;
+		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+	}
+	return parts.join("\n");
+}
+
+function durableMessages(messages: Context["messages"], config: DynamicContextConfig): Context["messages"] {
+	if (config.enabled !== true || config.stripFromSession === false) return messages;
+	return messages.filter((message) => !matchesDynamicContext(message, config));
+}
+
+function collectDynamicContextBeforeLastUser(messages: Context["messages"], config: DynamicContextConfig): string {
+	if (config.enabled !== true) return "";
+	let lastUserIndex = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "user") {
+			lastUserIndex = i;
+			break;
+		}
+	}
+	if (lastUserIndex === -1) return "";
+	const parts: string[] = [];
+	for (const message of messages.slice(0, lastUserIndex)) {
+		if (!matchesDynamicContext(message, config)) continue;
+		const text = dynamicContextText(message).trim();
+		if (text) parts.push(text);
+	}
+	return parts.join("\n\n");
+}
+
+function wrapPromptWithDynamicContext(prompt: string, dynamicContext: string, config: DynamicContextConfig): string {
+	const context = dynamicContext.trim();
+	if (!context) return prompt;
+	const tag = config.wrapUserRequestTag?.trim();
+	if (!tag) return `${context}\n\n${prompt}`;
+	return `${context}\n\n<${tag}>\n${prompt}\n</${tag}>`;
+}
+
+function prependDynamicContextBlock(blocks: ContentBlockParam[], dynamicContext: string): ContentBlockParam[] {
+	const context = dynamicContext.trim();
+	if (!context) return blocks;
+	return [{ type: "text", text: context }, ...blocks];
+}
+
 /**
  * Ensure the shared session has all messages up to (but not including) the last user message.
  * Returns session ID to resume from, or null if no resume needed.
@@ -372,8 +470,10 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
+	dynamicContextConfig?: DynamicContextConfig,
 ): SyncResult {
 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
+	const importPriorMessages = durableMessages(priorMessages, dynamicContextConfig ?? DEFAULT_DYNAMIC_CONTEXT_CONFIG);
 
 	// REUSE path
 	if (sharedSession && !sharedSession.needsRebuild) {
@@ -413,7 +513,7 @@ function syncSharedSession(
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		...(modelId ? { model: modelId } : {}),
 	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+	convertAndImportMessages(session, importPriorMessages, customToolNameToSdk);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
 	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
@@ -936,9 +1036,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const { sessionId: resumeSessionId } = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
+	const cfg = loadConfig(cwd);
+	const providerSettings = cfg.provider ?? {};
+	const dynamicContextConfig = resolveDynamicContextConfig(providerSettings.dynamicContext);
+	const dynamicContext = collectDynamicContextBeforeLastUser(context.messages, dynamicContextConfig);
+	const { sessionId: resumeSessionId } = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, dynamicContextConfig);
 	const promptBlocks = extractUserPromptBlocks(context.messages);
-	let promptText = extractUserPrompt(context.messages) ?? "";
+	let promptText = wrapPromptWithDynamicContext(extractUserPrompt(context.messages) ?? "", dynamicContext, dynamicContextConfig);
 
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with the state stack fix — dump diagnostics if it does.
@@ -957,11 +1061,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
-		? wrapPromptStream(promptBlocks)
+		? wrapPromptStream(prependDynamicContextBlock(promptBlocks, dynamicContext))
 		: promptText;
 	const mcpServers = buildMcpServers(mcpTools, ctx());
-	const cfg = loadConfig(cwd);
-	const providerSettings = cfg.provider ?? {};
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const systemPrompt = appendSystemPrompt
 		? buildForwardedSystemPrompt(context.systemPrompt, {
@@ -1189,6 +1291,10 @@ async function promptAndWait(
 ): Promise<{ responseText: string; stopReason: string }> {
 	const cwd = process.cwd();
 	const modelId = resolveModelId(options?.model ?? "opus");
+	const askCfg = loadConfig(cwd);
+	const dynamicContextConfig = resolveDynamicContextConfig(askCfg.provider?.dynamicContext);
+	const dynamicContext = options?.context ? collectDynamicContextBeforeLastUser(options.context, dynamicContextConfig) : "";
+	const promptWithDynamicContext = wrapPromptWithDynamicContext(prompt, dynamicContext, dynamicContextConfig);
 
 	// Session resume for shared mode — reuse provider's session if it exists,
 	// otherwise create one from pi's context.
@@ -1203,7 +1309,8 @@ async function promptAndWait(
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
+			const dynamicContextConfig = resolveDynamicContextConfig(loadConfig(cwd).provider?.dynamicContext);
+			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId, dynamicContextConfig);
 			resumeSessionId = sync.sessionId;
 		}
 	}
@@ -1224,7 +1331,6 @@ async function promptAndWait(
 	const effort = options?.thinking && options.thinking !== "off"
 		? REASONING_TO_EFFORT[options.thinking] : undefined;
 
-	const askCfg = loadConfig(cwd);
 	const claudeExecutable = askCfg.provider?.pathToClaudeCodeExecutable;
 	// Default scope matches the previous hardcoded ["user", "project"]; [] disables CLAUDE.md.
 	const askSettingSources: SettingSource[] = scopeToSettingSources(
@@ -1241,10 +1347,10 @@ async function promptAndWait(
 		`mode=${mode} model=${modelId} effort=${effort ?? "default"}`,
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
 		`systemPrompt=custom len=${systemPrompt.length}`,
-		`promptLen=${prompt.length}`);
+		`promptLen=${promptWithDynamicContext.length}`);
 
 	const sdkQuery = query({
-		prompt,
+		prompt: promptWithDynamicContext,
 		options: {
 			cwd,
 			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },

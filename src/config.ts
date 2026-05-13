@@ -17,6 +17,16 @@ import { join } from "path";
  */
 export type ClaudeMdScope = "project" | "global";
 
+export interface DynamicContextConfig {
+	enabled?: boolean;
+	match?: {
+		customType?: string;
+		details?: Record<string, unknown>;
+	};
+	stripFromSession?: boolean;
+	wrapUserRequestTag?: string;
+}
+
 export interface Config {
 	/**
 	 * Controls which CLAUDE.md files Claude Code attaches to its context
@@ -39,6 +49,7 @@ export interface Config {
 	provider?: {
 		appendSystemPrompt?: boolean;
 		systemPromptForwarding?: SystemPromptForwardingConfig;
+		dynamicContext?: DynamicContextConfig;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;
